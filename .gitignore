@@ -1,3 +1,5 @@
 .oneflip/
 model_template/
 augment/
+bash/
+saved_model/

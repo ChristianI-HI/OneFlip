@@ -26,6 +26,7 @@ parser.add_argument('-device', type=int, default=0, help='which device you want 
 parser.add_argument('-save_dir', default='saved_model/', help='where the trained model is saved')
 parser.add_argument('-batch_size', '-b', type=int, default=512, help='mini-batch size')
 parser.add_argument('-n_classes',type=int,default=1,help='class num')
+parser.add_argument('-model_num', type=int, default=None, help='(optional) 0-based index of the model file to evaluate (from sorted list)')
 
 args = parser.parse_args()
 
@@ -176,6 +177,66 @@ def test_attack_performance(net, testloader, mask, trigger, class_num):
     return correct / total
 
 
+# Helper: try to robustly load a possibly-quantized or differently-typed state dict
+def safe_load_state_dict(model, path, device=None):
+    """Load a state dict saved at `path` into `model`.
+    Handles the common wrappers ({'state_dict': ...}), attempts to cast non-float tensors
+    (e.g. int8/uint8) to float before loading. Loads onto CPU first and then model can be moved to device.
+    Uses strict=False as a fallback for unmatched keys.
+    """
+    data = torch.load(path, map_location='cpu')
+
+    # Unwrap if necessary
+    if isinstance(data, dict) and 'state_dict' in data:
+        state_dict = data['state_dict']
+    else:
+        state_dict = data
+
+    # If someone saved the whole nn.Module, try to extract .state_dict()
+    if not isinstance(state_dict, dict):
+        try:
+            state_dict = data.state_dict()
+        except Exception:
+            # Unknown format: try direct load and let error bubble up
+            try:
+                model.load_state_dict(data)
+                return
+            except Exception:
+                raise RuntimeError(f"Unable to parse saved object at {path}")
+
+    # Try direct load first
+    try:
+        model.load_state_dict(state_dict)
+        return
+    except Exception:
+        # attempt dtype fixes (e.g., int8 -> float)
+        fixed = {}
+        for k, v in state_dict.items():
+            if isinstance(v, torch.Tensor):
+                # If not a floating type, convert to float (common for int8 quantized dumps)
+                if not v.is_floating_point():
+                    try:
+                        v = v.float()
+                    except Exception:
+                        # last resort: convert via numpy
+                        v = torch.tensor(v.cpu().numpy(), dtype=torch.float32)
+                fixed[k] = v
+            else:
+                fixed[k] = v
+
+        # Try loading converted state dict (non-strict first)
+        try:
+            model.load_state_dict(fixed, strict=False)
+            return
+        except Exception as e:
+            # As a last resort, try matching 'module.' prefixes/unprefixing
+            new_fixed = {}
+            for k, v in fixed.items():
+                new_fixed[k.replace('module.', '')] = v
+            model.load_state_dict(new_fixed, strict=False)
+            return
+
+
 
 if __name__ == "__main__":
     # set device
@@ -194,29 +255,49 @@ if __name__ == "__main__":
     
     model_dir = args.save_dir+"/"+args.backbone+"_"+args.dataset+"/"
 
-    model_filename_set = [file for file in os.listdir(model_dir) if file.endswith('.pth')]
+    # collect model files (common extensions .pth and .pt)
+    model_filename_set = [file for file in os.listdir(model_dir) if file.endswith('.pth') or file.endswith('.pt')]
+    model_filename_set.sort()
+
+    # If a specific model number is requested, match it against the filenames
+    # The intended use is to pass the integer present in the file name (e.g. clean_model_int8_1.pth -> model_num=1)
+    if args.model_num is not None:
+        num = int(args.model_num)
+        # try to match pattern like '_int8_<num>' first (common in this repo)
+        pattern = re.compile(rf'_int8_{num}(?:_|\.|$)')
+        matched = [f for f in model_filename_set if pattern.search(f)]
+        # fallback: match the number as a separate token (not part of a larger number)
+        if not matched:
+            token_pattern = re.compile(rf'(?<!\d){num}(?!\d)')
+            matched = [f for f in model_filename_set if token_pattern.search(f)]
+        if not matched:
+            raise IndexError(f"model_num {args.model_num} not found in model files: {model_filename_set}")
+        # use the matched files (usually one)
+        model_filename_set = matched
     
     for model_name in model_filename_set:
         print(model_name)
-        model.load_state_dict(torch.load(model_dir+model_name))    
+        # Load original model weights (handles quantized/different dtypes)
+        safe_load_state_dict(model, model_dir+model_name, device)
         original_acc = test_effectiveness(model,testloader)
         print(original_acc)
 
         original_weights = copy.deepcopy(model.fc.weight.data)
-        
-        backdoor_model_dir = model_dir + "backdoored_models/" + model_name[:-4] + "/"
+
+        base_name = os.path.splitext(model_name)[0]
+        backdoor_model_dir = os.path.join(model_dir, "backdoored_models", base_name) + os.sep
 
         backdoor_model_filename_set = [file for file in os.listdir(backdoor_model_dir) if file.endswith('.pth')]
 
-        with open(model_dir+model_name[:-4]+"_neuron_trigger_pair.pkl", 'rb') as file:
+        with open(os.path.join(model_dir, base_name + "_neuron_trigger_pair.pkl"), 'rb') as file:
             neuron_trigger_pair = pickle.load(file)
         
         test_result = []
 
         for backdoor_model_name in backdoor_model_filename_set:
             backdoor_model =  CustomNetwork(args.backbone,args.dataset,args.n_classes)
-            backdoor_model.load_state_dict(torch.load(backdoor_model_dir+backdoor_model_name))  
-
+            # Load backdoored model
+            safe_load_state_dict(backdoor_model, backdoor_model_dir+backdoor_model_name, device)
             if torch.cuda.is_available():
                 backdoor_model.to(device)
             

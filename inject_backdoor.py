@@ -27,6 +27,9 @@ parser.add_argument('-save_dir', default='saved_model/', help='where the trained
 parser.add_argument('-batch_size', '-b', type=int, default=1024, help='mini-batch size')
 parser.add_argument('-n_classes',type=int,default=1,help='class num')
 parser.add_argument('-quantization', type=str, default=None, help='Quantization type. Options: None, int4, int8.')
+parser.add_argument('--trigger_epochs', type=int, default=500, help='Number of epochs to optimize each trigger')
+parser.add_argument('--trigger_subset', type=int, default=0, help='If >0, use this many images from the batch for trigger optimization (0 means use full batch)')
+parser.add_argument('--learning_rate', '-lr', type=float, default=0.01, help='Learning rate for trigger optimization')
 
 args = parser.parse_args()
 
@@ -180,6 +183,11 @@ def load_data(dataset,args):
 def obtain_original_acc(testloader, model):
     dataiter = iter(testloader)
     images, labels = next(dataiter)
+    # Optionally use a smaller subset of the batch for faster trigger optimization
+    if hasattr(args, 'trigger_subset') and args.trigger_subset and args.trigger_subset > 0 and args.trigger_subset < images.size(0):
+        images = images[:args.trigger_subset]
+        labels = labels[:args.trigger_subset]
+
     images, labels = images.to(device), labels.to(device)
     correct = 0
     total = 0
@@ -255,8 +263,14 @@ def obtain_neuron_tirgger_pair(least_impact_weight_set, model, testloader, model
     print(neuron_num_set)  
     dataiter = iter(testloader)
     images, labels = next(dataiter)
+
+    # Optionally use a smaller subset of the batch for faster trigger optimization
+    if hasattr(args, 'trigger_subset') and args.trigger_subset and args.trigger_subset > 0 and args.trigger_subset < images.size(0):
+        images = images[:args.trigger_subset]
+        labels = labels[:args.trigger_subset]
+
     images, labels = images.to(device), labels.to(device)
-    
+
     neuron_trigger_pair = {}
     for neuron_num in neuron_num_set:
         print("Generating Trigger for Neuron: ", neuron_num)
@@ -265,18 +279,18 @@ def obtain_neuron_tirgger_pair(least_impact_weight_set, model, testloader, model
         trigger = trigger.to(device).detach().requires_grad_(True)
         mask = torch.rand((width, height), requires_grad=True)
         mask = mask.to(device).detach().requires_grad_(True)
-    
-        Epochs = 500
+
+        Epochs = args.trigger_epochs if hasattr(args, 'trigger_epochs') else 500
         lamda = 0.001
-    
+
         min_norm = np.inf
         min_norm_count = 0
-        
+
         criterion = torch.nn.CrossEntropyLoss()
-        optimizer = torch.optim.Adam([{"params": trigger},{"params": mask}],lr=0.01)
-        
+        optimizer = torch.optim.Adam([{"params": trigger}, {"params": mask}], lr=args.learning_rate if hasattr(args, 'learning_rate') else 0.01)
+
         model.eval()
-    
+
         for epoch in range(Epochs):
             norm = 0.0
             optimizer.zero_grad()
@@ -286,16 +300,22 @@ def obtain_neuron_tirgger_pair(least_impact_weight_set, model, testloader, model
             loss = criterion(x1, y_target) + lamda * torch.sum(torch.abs(mask))
             loss.backward()
             optimizer.step()
-    
+
             # figure norm
             with torch.no_grad():
                 torch.clip_(trigger, 0, 1)
                 torch.clip_(mask, 0, 1)
                 norm = torch.sum(torch.abs(mask))
-        print("epoch: {}, norm: {}".format(epoch,norm))
+
+            if norm < min_norm:
+                min_norm = norm
+                min_norm_count = 0
+            else:
+                min_norm_count += 1
+
+        print("epoch: {}, norm: {}".format(epoch, norm))
         print(x1[:,neuron_num].mean())
 
-    
         neuron_trigger_pair[neuron_num] = (mask, trigger)
 
     with open(model_dir+model_name[:-4]+'_neuron_trigger_pair.pkl', 'wb') as pickle_file:
@@ -319,7 +339,8 @@ def obtain_neuron_class_pair(least_impact_weight_set):
 def injecting_backdoor(neuron_trigger_pair, neuron_class_pair, original_weights, model, test_loader, model_dir, model_name, args):
     new_backdoored_model_num = 0
 
-    dataiter = iter(testloader)
+    # use the provided test_loader parameter (was using global testloader accidentally)
+    dataiter = iter(test_loader)
     images, labels = next(dataiter)
     images, labels = images.to(device), labels.to(device)
     
@@ -365,21 +386,31 @@ def injecting_backdoor(neuron_trigger_pair, neuron_class_pair, original_weights,
             total += target_labels.size(0)
             correct += (predicted == target_labels).sum().item()
             asr = correct / total
+            # print both rounded percent and raw value for debugging
             print(f'Accuracy: {100 * correct / total:.2f}%')
+            # print("ASR raw:", asr, "repr:", repr(asr))
             print()
 
-            if asr == 1:
+            # Allow small numerical deviations when checking attack success rate
+            # (strict equality with 1.0 can fail due to floating point rounding)
+            if asr >= 0.99:
                 new_backdoored_model_num += 1
-                model_new_path = model_dir + 'backdoored_models/'
-                if not os.path.exists(model_new_path):
-                    os.mkdir(model_new_path)
-                model_new_path +=  model_name[:-4]+ '/'
-                if not os.path.exists(model_new_path):
-                    os.mkdir(model_new_path)
+                # create base backdoored models directory robustly
+                model_new_base = os.path.join(model_dir, 'backdoored_models')
+                os.makedirs(model_new_base, exist_ok=True)
+                # create model-specific subdirectory
+                model_new_path = os.path.join(model_new_base, model_name[:-4])
+                os.makedirs(model_new_path, exist_ok=True)
 
-                model_new_name = 'neuron_num_' + str(neuron_num) + '_class_num_' + str(class_num) + '_ba_' + str(ba) + '_asr_' + str(asr) + '.pth'
+                model_new_name = f'neuron_num_{neuron_num}_class_num_{class_num}_ba_{ba:.6f}_asr_{asr:.6f}.pth'
 
-                torch.save(model.state_dict(), model_new_path+model_new_name)
+                abs_path = os.path.abspath(os.path.join(model_new_path, model_new_name))
+                print(f"Attempting to save backdoored model to: {abs_path}")
+                try:
+                    torch.save(model.state_dict(), abs_path)
+                    print(f"Saved backdoored model: {abs_path}")
+                except Exception as e:
+                    print(f"ERROR saving backdoored model to {abs_path}: {e}")
     print("Total " + str(new_backdoored_model_num) + " models being injected!")
 
 # Custom neural network definition with plug-and-play backbone and FC layer
