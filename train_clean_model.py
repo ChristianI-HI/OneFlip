@@ -7,6 +7,7 @@ import argparse
 import os
 import yaml
 import logging
+import struct
 
 from augment.randaugment import RandomAugment
 from model_template.preactres import PreActResNet18
@@ -29,10 +30,8 @@ parser.add_argument('-weight_decay', type=float, default=4e-4, help='L2 regulari
 parser.add_argument('-n_classes',type=int,default=1,help='Number of classes in the classification task. Will be overwritten by dataset-specific settings.')
 parser.add_argument('-model_num',type=int, default=0, help='Model index for saving; useful when training multiple models.')
 parser.add_argument('-optimizer',type=str, default='SGD', help='Optimizer type. Options: SGD, RMSProp, Adam.')
-
-args = parser.parse_args()
-
-print('Supuer Parameters:', args.__dict__)
+parser.add_argument('-quantization', type=str, default=None, help='Quantization type. Options: None, int4, int8.')
+parser.add_argument('-qat_epochs', type=int, default=20, help='Number of epochs for quantization-aware training fine-tuning.')
 
 # === Data Loading Function ===
 # load_data(dataset, args)
@@ -144,26 +143,111 @@ def load_data(dataset,args):
         
 
 
+# === Quantization Helper Functions ===
+# Convert float to IEEE-754 representation for bit manipulation
+def float_to_ieee754(f):
+    return struct.unpack('!I', struct.pack('!f', f))[0]
+
+def ieee754_to_float(i):
+    return struct.unpack('!f', struct.pack('!I', i))[0]
+
+# Quantization functions for INT4 and INT8
+def quantize_tensor(tensor, num_bits=8):
+    """Quantize tensor to specified bit-width using symmetric quantization"""
+    qmin = -(2 ** (num_bits - 1))
+    qmax = 2 ** (num_bits - 1) - 1
+    
+    # Calculate scale
+    min_val = tensor.min()
+    max_val = tensor.max()
+    scale = max(abs(min_val), abs(max_val)) / qmax
+    
+    if scale == 0:
+        scale = 1.0
+    
+    # Quantize
+    q_tensor = torch.clamp(torch.round(tensor / scale), qmin, qmax)
+    
+    # Dequantize back to float
+    dq_tensor = q_tensor * scale
+    
+    return dq_tensor, scale
+
+class QuantizedLinear(nn.Module):
+    """Quantized Linear layer that maintains float representation for bit-flip attacks"""
+    def __init__(self, in_features, out_features, num_bits=8):
+        super(QuantizedLinear, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_bits = num_bits
+        
+        # Store weights as float32 for bit-flip compatibility
+        self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.bias = nn.Parameter(torch.Tensor(out_features))
+        self.scale = nn.Parameter(torch.ones(1), requires_grad=False)
+        
+        # Initialize
+        nn.init.kaiming_uniform_(self.weight, a=0.01)
+        nn.init.constant_(self.bias, 0)
+    
+    def forward(self, x):
+        # Apply quantization constraint during forward pass
+        qmin = -(2 ** (self.num_bits - 1))
+        qmax = 2 ** (self.num_bits - 1) - 1
+        
+        # Quantize weights
+        w_q = torch.clamp(torch.round(self.weight / self.scale), qmin, qmax) * self.scale
+        
+        return F.linear(x, w_q, self.bias)
+    
+    def update_scale(self):
+        """Update quantization scale based on current weight distribution"""
+        qmax = 2 ** (self.num_bits - 1) - 1
+        max_val = max(abs(self.weight.min()), abs(self.weight.max()))
+        self.scale.data = torch.tensor([max_val / qmax if max_val > 0 else 1.0], device=self.weight.device)
+
 # === Model Setup ===
 # Instantiate the neural network model based on the specified backbone and dataset.
 # Facilitate obtaining the output of the last feature layer
 class CustomNetwork(nn.Module):
-    def __init__(self,backbone,dataset,num_classes):
+    def __init__(self,backbone,dataset,num_classes,quantization=None):
         super(CustomNetwork, self).__init__()
+        self.quantization = quantization
+        
         if dataset == 'CIFAR10':
             self.model = torchvision.models.resnet18(weights=None,num_classes=512)
-            self.fc = nn.Linear(512, num_classes)
+            if quantization == 'int4':
+                self.fc = QuantizedLinear(512, num_classes, num_bits=4)
+            elif quantization == 'int8':
+                self.fc = QuantizedLinear(512, num_classes, num_bits=8)
+            else:
+                self.fc = nn.Linear(512, num_classes)
         elif dataset == 'GTSRB':
             self.model = torchvision.models.vgg16(weights=None,num_classes=512)
-            self.fc = nn.Linear(512, num_classes)
+            if quantization == 'int4':
+                self.fc = QuantizedLinear(512, num_classes, num_bits=4)
+            elif quantization == 'int8':
+                self.fc = QuantizedLinear(512, num_classes, num_bits=8)
+            else:
+                self.fc = nn.Linear(512, num_classes)
         elif dataset == 'CIFAR100':
             self.model = PreActResNet18(num_classes=512)
-            self.fc = nn.Linear(512, num_classes)
+            if quantization == 'int4':
+                self.fc = QuantizedLinear(512, num_classes, num_bits=4)
+            elif quantization == 'int8':
+                self.fc = QuantizedLinear(512, num_classes, num_bits=8)
+            else:
+                self.fc = nn.Linear(512, num_classes)
 
     def forward(self, x):
         x = self.model(x)
         x = self.fc(x)
         return x
+    
+    def update_quantization_params(self):
+        """Update quantization parameters for QAT"""
+        if self.quantization and isinstance(self.fc, QuantizedLinear):
+            self.fc.update_scale()
 
 # Adjust the learning rate according to the epoch number.
 def adjust_learning_rate(args, optimizer, epoch):
@@ -199,6 +283,10 @@ def train(net, trainloader, criterion, optimizer, epoch, args):
         
         loss.backward()
         optimizer.step()
+        
+        # Update quantization parameters if using QAT
+        if args.quantization:
+            net.update_quantization_params()
 
         running_loss += loss.item()
 
@@ -220,14 +308,19 @@ def test(net, testloader):
 
 
 if __name__ == "__main__":
+    args = parser.parse_args()
+    
+    print('Super Parameters:', args.__dict__)
+    
     # set device
     device = torch.device("cuda:"+str(args.device) if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
 
     trainloader, testloader = load_data(args.dataset, args)
 
 
     # create model
-    model = CustomNetwork(args.backbone,args.dataset,args.n_classes)
+    model = CustomNetwork(args.backbone,args.dataset,args.n_classes,quantization=args.quantization)
         
     if torch.cuda.is_available():
         model.to(device)
@@ -240,13 +333,39 @@ if __name__ == "__main__":
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
+    # Regular training
     for epoch in range(args.epochs):
         train(model, trainloader, criterion, optimizer, epoch, args)
         test(model, testloader)
-    model_file = os.path.join(save_dir,'clean_model_'+str(args.model_num)+'.pth')
+    
+    # Quantization-aware training fine-tuning
+    if args.quantization:
+        print(f"\nStarting Quantization-Aware Training fine-tuning for {args.qat_epochs} epochs...")
+        # Reduce learning rate for fine-tuning
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = args.lr * 0.01
+        
+        for epoch in range(args.qat_epochs):
+            train(model, trainloader, criterion, optimizer, epoch, args)
+            test(model, testloader)
+        
+        print("QAT fine-tuning completed.")
+    
+    # Save model with quantization info in filename
+    if args.quantization:
+        model_file = os.path.join(save_dir,f'clean_model_{args.quantization}_{args.model_num}.pth')
+    else:
+        model_file = os.path.join(save_dir,'clean_model_'+str(args.model_num)+'.pth')
+    
     torch.save(model.state_dict(), model_file)
     args_dict = vars(args)
-    with open(os.path.join(save_dir,'clean_model_'+str(args.model_num)+'_args.yaml'), 'w') as f:
+    
+    if args.quantization:
+        yaml_file = os.path.join(save_dir,f'clean_model_{args.quantization}_{args.model_num}_args.yaml')
+    else:
+        yaml_file = os.path.join(save_dir,'clean_model_'+str(args.model_num)+'_args.yaml')
+    
+    with open(yaml_file, 'w') as f:
         yaml.dump(args_dict, f)
     print('Finished Training')
     

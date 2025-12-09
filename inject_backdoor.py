@@ -17,6 +17,7 @@ import os
 import copy
 import time
 import struct
+import yaml
 
 parser = argparse.ArgumentParser(description='Backdoor Injecting')
 parser.add_argument('-dataset', type=str,default='CIFAR10', help='Name of the dataset.')
@@ -25,6 +26,7 @@ parser.add_argument('-device', type=int, default=0, help='which device you want 
 parser.add_argument('-save_dir', default='saved_model/', help='where the trained model is saved')
 parser.add_argument('-batch_size', '-b', type=int, default=1024, help='mini-batch size')
 parser.add_argument('-n_classes',type=int,default=1,help='class num')
+parser.add_argument('-quantization', type=str, default=None, help='Quantization type. Options: None, int4, int8.')
 
 args = parser.parse_args()
 
@@ -58,6 +60,61 @@ def count_different_chars(str1, str2):
     count = sum(1 for a, b in zip(str1, str2) if a != b)
     
     return count
+
+# Quantization helper functions
+def quantize_tensor(tensor, num_bits=8):
+    """Quantize tensor to specified bit-width using symmetric quantization"""
+    qmin = -(2 ** (num_bits - 1))
+    qmax = 2 ** (num_bits - 1) - 1
+    
+    # Calculate scale
+    min_val = tensor.min()
+    max_val = tensor.max()
+    scale = max(abs(min_val), abs(max_val)) / qmax
+    
+    if scale == 0:
+        scale = 1.0
+    
+    # Quantize
+    q_tensor = torch.clamp(torch.round(tensor / scale), qmin, qmax)
+    
+    # Dequantize back to float
+    dq_tensor = q_tensor * scale
+    
+    return dq_tensor, scale
+
+class QuantizedLinear(nn.Module):
+    """Quantized Linear layer that maintains float representation for bit-flip attacks"""
+    def __init__(self, in_features, out_features, num_bits=8):
+        super(QuantizedLinear, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_bits = num_bits
+        
+        # Store weights as float32 for bit-flip compatibility
+        self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.bias = nn.Parameter(torch.Tensor(out_features))
+        self.scale = nn.Parameter(torch.ones(1), requires_grad=False)
+        
+        # Initialize
+        nn.init.kaiming_uniform_(self.weight, a=0.01)
+        nn.init.constant_(self.bias, 0)
+    
+    def forward(self, x):
+        # Apply quantization constraint during forward pass
+        qmin = -(2 ** (self.num_bits - 1))
+        qmax = 2 ** (self.num_bits - 1) - 1
+        
+        # Quantize weights
+        w_q = torch.clamp(torch.round(self.weight / self.scale), qmin, qmax) * self.scale
+        
+        return F.linear(x, w_q, self.bias)
+    
+    def update_scale(self):
+        """Update quantization scale based on current weight distribution"""
+        qmax = 2 ** (self.num_bits - 1) - 1
+        max_val = max(abs(self.weight.min()), abs(self.weight.max()))
+        self.scale.data = torch.tensor([max_val / qmax if max_val > 0 else 1.0])
 
 # Load dataset and apply appropriate transformations based on dataset type
 def load_data(dataset,args):
@@ -328,17 +385,34 @@ def injecting_backdoor(neuron_trigger_pair, neuron_class_pair, original_weights,
 # Custom neural network definition with plug-and-play backbone and FC layer
 # Returns both intermediate features and final predictions
 class CustomNetwork(nn.Module):
-    def __init__(self,backbone,dataset,num_classes):
+    def __init__(self,backbone,dataset,num_classes,quantization=None):
         super(CustomNetwork, self).__init__()
+        self.quantization = quantization
+        
         if dataset == 'CIFAR10':
             self.model = torchvision.models.resnet18(weights=None,num_classes=512)
-            self.fc = nn.Linear(512, num_classes)
+            if quantization == 'int4':
+                self.fc = QuantizedLinear(512, num_classes, num_bits=4)
+            elif quantization == 'int8':
+                self.fc = QuantizedLinear(512, num_classes, num_bits=8)
+            else:
+                self.fc = nn.Linear(512, num_classes)
         elif dataset == 'GTSRB':
             self.model = torchvision.models.vgg16(weights=None,num_classes=512)
-            self.fc = nn.Linear(512, num_classes)
+            if quantization == 'int4':
+                self.fc = QuantizedLinear(512, num_classes, num_bits=4)
+            elif quantization == 'int8':
+                self.fc = QuantizedLinear(512, num_classes, num_bits=8)
+            else:
+                self.fc = nn.Linear(512, num_classes)
         elif dataset == 'CIFAR100':
             self.model = PreActResNet18(num_classes=512)
-            self.fc = nn.Linear(512, num_classes)
+            if quantization == 'int4':
+                self.fc = QuantizedLinear(512, num_classes, num_bits=4)
+            elif quantization == 'int8':
+                self.fc = QuantizedLinear(512, num_classes, num_bits=8)
+            else:
+                self.fc = nn.Linear(512, num_classes)
 
     def forward(self, x):
         x1 = self.model(x)
@@ -351,12 +425,6 @@ if __name__ == "__main__":
 
     testloader = load_data(args.dataset, args)
 
-    # create model
-    model = CustomNetwork(args.backbone,args.dataset,args.n_classes)
-        
-    if torch.cuda.is_available():
-        model.to(device)
-
     model_dir = args.save_dir+"/"+args.backbone+"_"+args.dataset+"/"
     
     model_filename_set = [file for file in os.listdir(model_dir) if file.endswith('.pth')]
@@ -368,8 +436,39 @@ if __name__ == "__main__":
 
         start_time = time.time()
         
-        model.load_state_dict(torch.load(model_dir+model_name))    
-        original_weights = copy.deepcopy(model.fc.weight.data)
+        # Detect quantization from model name or args file
+        quantization = None
+        if 'int4' in model_name:
+            quantization = 'int4'
+        elif 'int8' in model_name:
+            quantization = 'int8'
+        elif args.quantization:
+            quantization = args.quantization
+        
+        # Try to load args from yaml if available
+        yaml_file = model_dir + model_name[:-4] + '_args.yaml'
+        if os.path.exists(yaml_file):
+            with open(yaml_file, 'r') as f:
+                model_args = yaml.safe_load(f)
+                if 'quantization' in model_args and model_args['quantization']:
+                    quantization = model_args['quantization']
+        
+        print(f"Loading model with quantization: {quantization}")
+        
+        # Create model with appropriate quantization
+        model = CustomNetwork(args.backbone, args.dataset, args.n_classes, quantization=quantization)
+        
+        if torch.cuda.is_available():
+            model.to(device)
+        
+        model.load_state_dict(torch.load(model_dir+model_name))
+        
+        # Access weights properly for both regular and quantized layers
+        if isinstance(model.fc, QuantizedLinear):
+            original_weights = copy.deepcopy(model.fc.weight.data)
+            print(f"Using quantized layer with {model.fc.num_bits} bits")
+        else:
+            original_weights = copy.deepcopy(model.fc.weight.data)
 
         original_acc = obtain_original_acc(testloader,model)
 
