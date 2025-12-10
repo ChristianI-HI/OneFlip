@@ -4,6 +4,8 @@ import argparse
 import os
 import re
 import glob
+import warnings
+import sys
 
 parser = argparse.ArgumentParser(description='Results Processing')
 parser.add_argument('-dataset', type=str,default='CIFAR10', help='Name of the dataset.')
@@ -16,10 +18,38 @@ print('Supuer Parameters:', args.__dict__)
 
 
 if __name__ == "__main__":
-    saved_dir = os.path.join("saved_model", args.backbone+"_"+args.dataset, "backdoored_models/",f'clean_model_{args.model_num}')
-    if not os.path.exists(saved_dir):
-        warnings.warn(f"Directory does not exist: {saved_dir}")
+    base_backdoored = os.path.join("saved_model", f"{args.backbone}_{args.dataset}", "backdoored_models")
+    if not os.path.exists(base_backdoored):
+        warnings.warn(f"Directory does not exist: {base_backdoored}")
         sys.exit(1)
+
+    # Look for directories matching either:
+    #  - clean_model_<model_num>
+    #  - clean_model_int8_<model_num>
+    # and be tolerant of small naming variations. Choose the first match if multiple found.
+    model_regex = re.compile(rf'^clean_model(?:_int8)?_{args.model_num}(_.*)?$')
+    candidates = []
+    for name in os.listdir(base_backdoored):
+        path = os.path.join(base_backdoored, name)
+        if not os.path.isdir(path):
+            continue
+        if model_regex.match(name):
+            candidates.append(path)
+
+    # As a fallback, try to match directories like clean_model_int8_<X> where X equals model_num
+    if not candidates:
+        alt_regex = re.compile(r'^clean_model_int8_(\d+)(_.*)?$')
+        for name in os.listdir(base_backdoored):
+            m = alt_regex.match(name)
+            if m and int(m.group(1)) == args.model_num:
+                candidates.append(os.path.join(base_backdoored, name))
+
+    if not candidates:
+        warnings.warn(f"No model directories found for model_num={args.model_num} in {base_backdoored}")
+        sys.exit(1)
+
+    # pick the first candidate (sorted for deterministic behavior)
+    saved_dir = sorted(candidates)[0]
 
     csv_files = glob.glob(os.path.join(saved_dir, "*.csv"))
     if not csv_files:

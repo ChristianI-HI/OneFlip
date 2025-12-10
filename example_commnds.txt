@@ -1,0 +1,7 @@
+python train_clean_model.py -dataset CIFAR10 -backbone resnet -device 0 -quantization int8 -qat_epochs 0 -model_num 2 -epochs 20
+
+python inject_backdoor.py -dataset CIFAR10 -backbone resnet --trigger_epochs 100 --learning_rate 0.02 --model_num 2
+
+python test_attack_performance.py -dataset CIFAR10 -backbone resnet -device 0 -model_num 2
+
+python process_results.py -dataset CIFAR10 -backbone resnet -model_num 2

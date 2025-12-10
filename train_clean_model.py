@@ -8,6 +8,7 @@ import os
 import yaml
 import logging
 import struct
+import time
 
 from augment.randaugment import RandomAugment
 from model_template.preactres import PreActResNet18
@@ -31,7 +32,7 @@ parser.add_argument('-n_classes',type=int,default=1,help='Number of classes in t
 parser.add_argument('-model_num',type=int, default=0, help='Model index for saving; useful when training multiple models.')
 parser.add_argument('-optimizer',type=str, default='SGD', help='Optimizer type. Options: SGD, RMSProp, Adam.')
 parser.add_argument('-quantization', type=str, default=None, help='Quantization type. Options: None, int4, int8.')
-parser.add_argument('-qat_epochs', type=int, default=20, help='Number of epochs for quantization-aware training fine-tuning.')
+parser.add_argument('-qat_epochs', type=int, default=0, help='Number of epochs for quantization-aware training fine-tuning.')
 
 # === Data Loading Function ===
 # load_data(dataset, args)
@@ -303,8 +304,101 @@ def test(net, testloader):
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
-    print(f'Accuracy: {100 * correct / total:.2f}%')
+    acc = 100 * correct / total if total > 0 else 0.0
+    print(f'Accuracy: {acc:.2f}%')
+    return acc
 
+
+def save_quantized_model(model, model_file, quantization_type):
+    """
+    Save model with true integer quantized weights for the final FC layer.
+    For quantized models, we save:
+    - Backbone weights as float32 (unchanged)
+    - FC layer weights as integer (int8 or int16 depending on bit width)
+    - FC layer quantization scale
+    - FC layer bias as float32
+    """
+    state_dict = model.state_dict()
+    
+    # Determine bit width and data type
+    if quantization_type == 'int4':
+        num_bits = 4
+        # int4 doesn't have native PyTorch dtype, use int8 for storage
+        dtype = torch.int8
+    elif quantization_type == 'int8':
+        num_bits = 8
+        dtype = torch.int8
+    else:
+        raise ValueError(f"Unsupported quantization type: {quantization_type}")
+    
+    qmin = -(2 ** (num_bits - 1))
+    qmax = 2 ** (num_bits - 1) - 1
+    
+    # Get FC layer weights
+    fc_weight = state_dict['fc.weight'].cpu()
+    fc_bias = state_dict['fc.bias'].cpu()
+    
+    # Calculate quantization scale (symmetric quantization)
+    weight_max = max(abs(fc_weight.min().item()), abs(fc_weight.max().item()))
+    scale = weight_max / qmax if weight_max > 0 else 1.0
+    
+    # Quantize to integers
+    q_weight = torch.clamp(torch.round(fc_weight / scale), qmin, qmax).to(dtype)
+    
+    # Create new state dict with quantized weights
+    quantized_state_dict = {}
+    for key, value in state_dict.items():
+        if key == 'fc.weight':
+            # Save quantized integer weights
+            quantized_state_dict['fc.weight_quantized'] = q_weight
+            quantized_state_dict['fc.weight_scale'] = torch.tensor(scale, dtype=torch.float32)
+            quantized_state_dict['fc.weight_num_bits'] = torch.tensor(num_bits, dtype=torch.int32)
+        elif key == 'fc.scale':
+            # Don't save the QAT scale parameter, we're using our own scale
+            continue
+        else:
+            # Save all other weights as-is
+            quantized_state_dict[key] = value.cpu()
+    
+    torch.save(quantized_state_dict, model_file)
+    print(f"Saved quantized model with {num_bits}-bit FC weights (scale={scale:.6f})")
+    print(f"Integer weight range: [{q_weight.min().item()}, {q_weight.max().item()}]")
+
+
+def load_quantized_model(model, model_file):
+    """
+    Load model with integer quantized FC weights and reconstruct float weights.
+    Returns the model with weights loaded and the quantization metadata.
+    """
+    checkpoint = torch.load(model_file, map_location='cpu')
+    
+    # Check if this is a quantized model
+    if 'fc.weight_quantized' in checkpoint:
+        q_weight = checkpoint['fc.weight_quantized']
+        scale = checkpoint['fc.weight_scale'].item()
+        num_bits = checkpoint['fc.weight_num_bits'].item()
+        
+        # Reconstruct float weights from quantized integers
+        fc_weight_float = q_weight.float() * scale
+        
+        # Create standard state dict for loading
+        state_dict = {}
+        for key, value in checkpoint.items():
+            if key == 'fc.weight_quantized':
+                state_dict['fc.weight'] = fc_weight_float
+            elif key.startswith('fc.weight_scale') or key.startswith('fc.weight_num_bits'):
+                continue  # Skip metadata
+            else:
+                state_dict[key] = value
+        
+        model.load_state_dict(state_dict, strict=False)
+        
+        print(f"Loaded quantized model with {num_bits}-bit FC weights (scale={scale:.6f})")
+        return model, {'scale': scale, 'num_bits': num_bits, 'q_weight': q_weight}
+    else:
+        # Regular non-quantized model
+        model.load_state_dict(checkpoint)
+        return model, None
 
 
 if __name__ == "__main__":
@@ -333,10 +427,29 @@ if __name__ == "__main__":
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
+    # Prepare checks file to record accuracy and elapsed time at key epochs
+    checks_file = os.path.join(save_dir, f'clean_model_{args.model_num}_checks.txt')
+    # epochs to record (human-indexed)
+    record_epochs = [20, 50, 100, 150, 200]
+    # create/overwrite file with header
+    with open(checks_file, 'w') as cf:
+        cf.write('epoch,accuracy_percent,elapsed_seconds\n')
+
+    # track training start time for runtime plotting
+    training_start_time = time.time()
+
     # Regular training
     for epoch in range(args.epochs):
         train(model, trainloader, criterion, optimizer, epoch, args)
-        test(model, testloader)
+        acc = test(model, testloader)
+
+        # Record accuracy and elapsed time at specified epochs
+        human_epoch = epoch + 1
+        if human_epoch in record_epochs:
+            elapsed = time.time() - training_start_time
+            # append to checks file
+            with open(checks_file, 'a') as cf:
+                cf.write(f"{human_epoch},{acc:.4f},{elapsed:.4f}\n")
     
     # Quantization-aware training fine-tuning
     if args.quantization:
@@ -354,10 +467,12 @@ if __name__ == "__main__":
     # Save model with quantization info in filename
     if args.quantization:
         model_file = os.path.join(save_dir,f'clean_model_{args.quantization}_{args.model_num}.pth')
+        # Save quantized integer representation
+        save_quantized_model(model, model_file, args.quantization)
     else:
         model_file = os.path.join(save_dir,'clean_model_'+str(args.model_num)+'.pth')
+        torch.save(model.state_dict(), model_file)
     
-    torch.save(model.state_dict(), model_file)
     args_dict = vars(args)
     
     if args.quantization:

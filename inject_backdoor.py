@@ -18,6 +18,8 @@ import copy
 import time
 import struct
 import yaml
+import re
+import sys
 
 parser = argparse.ArgumentParser(description='Backdoor Injecting')
 parser.add_argument('-dataset', type=str,default='CIFAR10', help='Name of the dataset.')
@@ -30,6 +32,8 @@ parser.add_argument('-quantization', type=str, default=None, help='Quantization 
 parser.add_argument('--trigger_epochs', type=int, default=500, help='Number of epochs to optimize each trigger')
 parser.add_argument('--trigger_subset', type=int, default=0, help='If >0, use this many images from the batch for trigger optimization (0 means use full batch)')
 parser.add_argument('--learning_rate', '-lr', type=float, default=0.01, help='Learning rate for trigger optimization')
+parser.add_argument('--model_num', type=int, default=None, help='Select the model number to inject (matches files like clean_model_int8_X.pth)')
+parser.add_argument('--bit_search_topk', type=int, default=8, help='When searching integer bit flips, evaluate only the top-k candidate bit positions (by estimated float-change). Set to num_bits to do exhaustive search')
 
 args = parser.parse_args()
 
@@ -62,6 +66,144 @@ def count_different_chars(str1, str2):
 
     count = sum(1 for a, b in zip(str1, str2) if a != b)
     
+    return count
+
+# === Integer Quantization Bit-Flip Functions ===
+def flip_single_bit_int(int_val, bit_position, num_bits=8):
+    """
+    Flip a specific bit in an integer value.
+    
+    Args:
+        int_val: signed integer value
+        bit_position: bit position to flip (0 = LSB, num_bits-1 = MSB/sign bit)
+        num_bits: bit width (4 or 8)
+    
+    Returns:
+        signed integer with bit flipped
+    """
+    if num_bits == 4:
+        mask = 0x0F
+        max_bits = 4
+    elif num_bits == 8:
+        mask = 0xFF
+        max_bits = 8
+    else:
+        raise ValueError(f"Unsupported bit width: {num_bits}")
+    
+    # Convert to unsigned representation
+    if int_val < 0:
+        unsigned_val = (1 << max_bits) + int_val
+    else:
+        unsigned_val = int_val
+    
+    unsigned_val = unsigned_val & mask
+    
+    # Flip the specified bit
+    flipped = unsigned_val ^ (1 << bit_position)
+    flipped = flipped & mask
+    
+    # Convert back to signed
+    if flipped >= (1 << (max_bits - 1)):
+        result = flipped - (1 << max_bits)
+    else:
+        result = flipped
+    
+    return result
+
+def get_all_single_bit_flips_int(int_val, num_bits=8):
+    """
+    Generate all possible single-bit flips of an integer value.
+    
+    Returns:
+        list of (bit_position, flipped_value) tuples
+    """
+    results = []
+    for bit_pos in range(num_bits):
+        flipped = flip_single_bit_int(int_val, bit_pos, num_bits)
+        results.append((bit_pos, flipped))
+    return results
+
+
+def get_topk_bit_candidates_int(int_val, num_bits, scale, topk=3):
+    """
+    Estimate float change for flipping each integer bit and return top-k bit candidates.
+    Returns list of (bit_pos, flipped_val) ordered by largest estimated float delta.
+    """
+    candidates = []
+    for bit_pos in range(num_bits):
+        flipped = flip_single_bit_int(int_val, bit_pos, num_bits)
+        # Estimate absolute float change produced by this flip
+        delta = abs((flipped - int_val) * scale)
+        candidates.append((bit_pos, flipped, delta))
+
+    # sort by estimated float-change descending (largest effect first)
+    candidates.sort(key=lambda x: x[2], reverse=True)
+
+    # clip topk
+    topk = min(topk, len(candidates))
+    return [(c[0], c[1]) for c in candidates[:topk]]
+
+def flip_rightmost_zero_bit_int(int_val, num_bits=8):
+    """
+    Flip the rightmost zero bit in an integer value.
+    DEPRECATED: Use get_all_single_bit_flips_int() for better results.
+    """
+    if num_bits == 4:
+        mask = 0x0F
+        max_bits = 4
+    elif num_bits == 8:
+        mask = 0xFF
+        max_bits = 8
+    else:
+        raise ValueError(f"Unsupported bit width: {num_bits}")
+    
+    # Convert to unsigned representation for bit manipulation
+    if int_val < 0:
+        # Two's complement representation
+        unsigned_val = (1 << max_bits) + int_val
+    else:
+        unsigned_val = int_val
+    
+    unsigned_val = unsigned_val & mask
+    
+    # Find rightmost zero bit
+    rightmost_zero = (~unsigned_val) & (unsigned_val + 1)
+    
+    # Flip it
+    flipped = unsigned_val ^ rightmost_zero
+    flipped = flipped & mask
+    
+    # Convert back to signed
+    if flipped >= (1 << (max_bits - 1)):
+        result = flipped - (1 << max_bits)
+    else:
+        result = flipped
+    
+    return result
+
+def count_different_bits_int(val1, val2, num_bits=8):
+    """Count differing bits between two integer values"""
+    if num_bits == 4:
+        mask = 0x0F
+        max_bits = 4
+    elif num_bits == 8:
+        mask = 0xFF
+        max_bits = 8
+    else:
+        raise ValueError(f"Unsupported bit width: {num_bits}")
+    
+    # Convert to unsigned for bit comparison
+    def to_unsigned(v, bits):
+        if v < 0:
+            return (1 << bits) + v
+        return v
+    
+    u1 = to_unsigned(val1, max_bits) & mask
+    u2 = to_unsigned(val2, max_bits) & mask
+    
+    # XOR and count set bits
+    diff = u1 ^ u2
+    count = bin(diff).count('1')
     return count
 
 # Quantization helper functions
@@ -198,8 +340,21 @@ def obtain_original_acc(testloader, model):
         _, predicted = torch.max(outputs.data, 1)
         total += labels.size(0)
         correct += (predicted == labels).sum().item()
-    print(f'Accuracy: {100 * correct / total:.2f}%')
-    return correct / total
+    acc = correct / total
+    print(f'Benign Accuracy: {100 * acc:.2f}%')
+    
+    # Check for suspiciously low accuracy that might indicate quantization issues
+    if acc < 0.3:  # Less than 30%
+        print("⚠ WARNING: Very low accuracy detected!")
+        print("  This might indicate quantization mismatch between training and inference.")
+        print("  Expected causes:")
+        print("  1. Scale parameter mismatch")
+        print("  2. QuantizedLinear vs nn.Linear layer mismatch") 
+        print("  3. Different quantization constraints during training vs inference")
+        print("  Consider checking model loading and quantization setup.")
+        print()
+    
+    return acc
 
 
 # Identify weights whose small perturbation minimally affects clean accuracy
@@ -326,14 +481,42 @@ def obtain_neuron_tirgger_pair(least_impact_weight_set, model, testloader, model
 
 
 def obtain_neuron_class_pair(least_impact_weight_set):
+    """
+    Extract neuron->class mapping from weight set.
+    Handles both old format [neuron, class] and new format [neuron, class, orig_val, flip_val, bit_pos]
+    """
     neuron_class_pair = {}
-    for neuron_num, class_num in least_impact_weight_set:
+    neuron_flip_info = {}  # Store flip information for each (neuron, class) pair
+    
+    for entry in least_impact_weight_set:
+        if len(entry) == 2:
+            # Old format: [neuron_num, class_num]
+            neuron_num, class_num = entry
+            flip_info = None
+        elif len(entry) >= 5:
+            # New format: [neuron_num, class_num, original_val, flipped_val, bit_pos]
+            neuron_num, class_num, original_val, flipped_val, bit_pos = entry[:5]
+            flip_info = {
+                'original_val': int(original_val),
+                'flipped_val': int(flipped_val),
+                'bit_pos': int(bit_pos)
+            }
+        else:
+            # Fallback
+            neuron_num, class_num = entry[0], entry[1]
+            flip_info = None
+        
         if neuron_num in neuron_class_pair:
             neuron_class_pair[neuron_num].append(class_num)
         else:
             neuron_class_pair[neuron_num] = [class_num]
+        
+        # Store flip info
+        if flip_info:
+            neuron_flip_info[(neuron_num, class_num)] = flip_info
+    
     print(neuron_class_pair)
-    return neuron_class_pair
+    return neuron_class_pair, neuron_flip_info
 
 
 def injecting_backdoor(neuron_trigger_pair, neuron_class_pair, original_weights, model, test_loader, model_dir, model_name, args):
@@ -413,6 +596,242 @@ def injecting_backdoor(neuron_trigger_pair, neuron_class_pair, original_weights,
                     print(f"ERROR saving backdoored model to {abs_path}: {e}")
     print("Total " + str(new_backdoored_model_num) + " models being injected!")
 
+
+# === Integer Quantized Weight Attack Functions ===
+
+def obtain_least_impact_weight_set_int(testloader, q_weights, scale, num_bits, model, model_dir, model_name, original_acc, args):
+    """
+    Identify weights whose single-bit flip in integer representation has minimal impact on accuracy.
+    Works with integer quantized weights (int4/int8).
+    Tries ALL possible single-bit flips to find the best candidates.
+    """
+    cache_file = model_dir + model_name[:-4] + '_potential_weights_int.npy'
+    if os.path.exists(cache_file):
+        least_impact_weight_set = np.load(cache_file, allow_pickle=True)
+        print(f"Loaded cached potential weights: {len(least_impact_weight_set)} candidates")
+        return least_impact_weight_set
+        
+    dataiter = iter(testloader)
+    images, labels = next(dataiter)
+    images, labels = images.to(device), labels.to(device)
+    
+    least_impact_weight_set = []
+    found_neurons = set()
+    
+    # Early termination parameters
+    MAX_NEURONS = 20  # Stop after finding this many vulnerable neurons
+    MAX_CANDIDATES = 50  # Stop after finding this many total candidates
+    
+    print(f"Searching for vulnerable weights (max {MAX_NEURONS} neurons, {MAX_CANDIDATES} candidates)...")
+    
+    # q_weights is [out_features, in_features] integer tensor
+    for i in range(q_weights.shape[1]):  # in_features (neurons)
+        # Early termination: stop if we have enough neurons
+        if len(found_neurons) >= MAX_NEURONS:
+            print(f"⏹ Early termination: Found {len(found_neurons)} neurons (target: {MAX_NEURONS})")
+            break
+            
+        neuron_has_candidate = False
+        
+        for j in range(q_weights.shape[0]):  # out_features (classes)
+            # Early termination: stop if we have enough total candidates
+            if len(least_impact_weight_set) >= MAX_CANDIDATES:
+                print(f"⏹ Early termination: Found {len(least_impact_weight_set)} candidates (target: {MAX_CANDIDATES})")
+                break
+                
+            # Get integer weight value
+            original_q_val = q_weights[j, i].item()
+
+            # Determine candidate bit flips. Use top-k heuristic to avoid exhaustive search
+            topk = getattr(args, 'bit_search_topk', None)
+            if topk is None:
+                topk = 3
+
+            # If topk >= num_bits, fall back to exhaustive list (preserve original behavior)
+            if topk >= num_bits:
+                candidate_flips = get_all_single_bit_flips_int(original_q_val, num_bits)
+            else:
+                candidate_flips = get_topk_bit_candidates_int(original_q_val, num_bits, scale, topk)
+
+            best_flip = None
+            best_impact = float('inf')
+
+            for bit_pos, flipped_q_val in candidate_flips:
+                # Skip if no change
+                if flipped_q_val == original_q_val:
+                    continue
+
+                # Reconstruct float weights with the flipped value
+                weights_float = q_weights.float() * scale
+                weights_float[j, i] = flipped_q_val * scale
+
+                # Temporarily update model weights
+                model.fc.weight.data = weights_float.to(device)
+
+                # Evaluate accuracy
+                model.eval()
+                correct = 0
+                total = 0
+                with torch.no_grad():
+                    _, outputs = model(images)
+                    _, predicted = torch.max(outputs.data, 1)
+                    total += labels.size(0)
+                    correct += (predicted == labels).sum().item()
+
+                present_acc = correct / total
+                impact = abs(original_acc - present_acc)
+
+                # Track best (lowest impact) flip for this weight
+                if impact < best_impact:
+                    best_impact = impact
+                    best_flip = (bit_pos, flipped_q_val)
+            
+            # Use stricter criteria to reduce candidates
+            impact_threshold = 0.005  # 0.5% accuracy drop max (stricter than 1%)
+            
+            # If we found a low-impact flip, save it
+            if best_flip and best_impact <= impact_threshold:
+                bit_pos, flipped_q_val = best_flip
+                # Save as [neuron, class, original_val, flipped_val, bit_pos]
+                least_impact_weight_set.append([i, j, original_q_val, flipped_q_val, bit_pos])
+                found_neurons.add(i)
+                neuron_has_candidate = True
+                
+                print(f'✓ Least impact weight found: neuron={i}, class={j} (impact: {best_impact*100:.2f}%)')
+                print(f'  Integer: {original_q_val} -> {flipped_q_val} (bit {bit_pos})')
+                print(f'  Float: {original_q_val*scale:.6f} -> {flipped_q_val*scale:.6f}')
+                
+                # Limit candidates per neuron to avoid redundancy
+                if neuron_has_candidate and len([x for x in least_impact_weight_set if x[0] == i]) >= 3:
+                    print(f"  (Skipping remaining classes for neuron {i} - enough candidates)")
+                    break
+        
+        # Progress indicator
+        if (i + 1) % 50 == 0:
+            print(f"Progress: {i+1}/{q_weights.shape[1]} neurons, found {len(found_neurons)} neurons, {len(least_impact_weight_set)} candidates")
+        
+        # Early exit from outer loop if we hit candidate limit
+        if len(least_impact_weight_set) >= MAX_CANDIDATES:
+            break
+    
+    # Save with allow_pickle=True since we now have variable-length entries
+    np.save(cache_file, least_impact_weight_set)
+    print(f"\n🎯 Found {len(least_impact_weight_set)} least-impact weights from {len(found_neurons)} neurons")
+    print(f"   Saved to {cache_file}")
+    return least_impact_weight_set
+
+
+def injecting_backdoor_int(neuron_trigger_pair, neuron_class_pair, neuron_flip_info, q_weights, scale, num_bits, model, test_loader, model_dir, model_name, args):
+    """
+    Inject backdoors by flipping bits in integer quantized weights.
+    This is the true low-precision attack on int4/int8 representations.
+    Uses pre-computed optimal bit flips from neuron_flip_info.
+    """
+    new_backdoored_model_num = 0
+
+    dataiter = iter(test_loader)
+    images, labels = next(dataiter)
+    images, labels = images.to(device), labels.to(device)
+    
+    for neuron_num in neuron_trigger_pair:
+        mask, trigger = neuron_trigger_pair[neuron_num]
+        class_set = neuron_class_pair[neuron_num]
+        
+        for class_num in class_set:
+            # Work with integer weights
+            q_weights_modified = q_weights.clone()
+            
+            original_q_val = q_weights_modified[class_num, neuron_num].item()
+            
+            # Use pre-computed flip if available, otherwise fall back to rightmost zero
+            if (neuron_num, class_num) in neuron_flip_info:
+                flip_info = neuron_flip_info[(neuron_num, class_num)]
+                flipped_q_val = flip_info['flipped_val']
+                bit_pos = flip_info['bit_pos']
+                print(f'\n=== Injecting backdoor into neuron={neuron_num}, target_class={class_num} ===')
+                print(f'Using pre-computed optimal flip (bit {bit_pos})')
+            else:
+                # Fallback to old method
+                flipped_q_val = flip_rightmost_zero_bit_int(original_q_val, num_bits)
+                bit_pos = -1
+                print(f'\n=== Injecting backdoor into neuron={neuron_num}, target_class={class_num} ===')
+                print(f'Using fallback flip method')
+            
+            print(f'Integer weight: {original_q_val} -> {flipped_q_val}')
+            print(f'Float equivalent: {original_q_val*scale:.6f} -> {flipped_q_val*scale:.6f}')
+            
+            bit_diff = count_different_bits_int(original_q_val, flipped_q_val, num_bits)
+            print(f'Bits flipped: {bit_diff}')
+            
+            # Update integer weight
+            q_weights_modified[class_num, neuron_num] = flipped_q_val
+            
+            # Reconstruct float weights and update model
+            weights_float = q_weights_modified.float() * scale
+            model.fc.weight.data = weights_float.to(device)
+            
+            # Test benign accuracy
+            model.eval()
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                _, outputs = model(images)
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+            ba = correct / total
+            print(f'Benign Accuracy: {100 * ba:.2f}%')
+            
+            # Test attack success rate
+            correct = 0
+            total = 0
+            target_labels = torch.full((images.shape[0],), class_num).to(device)
+            backdoor_images = (1 - torch.unsqueeze(mask, dim=0)) * images + torch.unsqueeze(mask, dim=0) * trigger
+            
+            with torch.no_grad():
+                _, outputs = model(backdoor_images)
+                _, predicted = torch.max(outputs.data, 1)
+                total += target_labels.size(0)
+                correct += (predicted == target_labels).sum().item()
+            asr = correct / total
+            print(f'Attack Success Rate: {100 * asr:.2f}%')
+            
+            # Save if attack is successful
+            if asr >= 0.99:
+                new_backdoored_model_num += 1
+                
+                # Save with integer quantized weights
+                model_new_base = os.path.join(model_dir, 'backdoored_models')
+                os.makedirs(model_new_base, exist_ok=True)
+                model_new_path = os.path.join(model_new_base, model_name[:-4])
+                os.makedirs(model_new_path, exist_ok=True)
+                
+                model_new_name = f'neuron_num_{neuron_num}_class_num_{class_num}_ba_{ba:.6f}_asr_{asr:.6f}.pth'
+                abs_path = os.path.abspath(os.path.join(model_new_path, model_new_name))
+                
+                # Save as quantized model with integer weights
+                state_dict = {}
+                for key, value in model.state_dict().items():
+                    if key == 'fc.weight':
+                        # Save quantized integer weights instead of float
+                        state_dict['fc.weight_quantized'] = q_weights_modified.cpu()
+                        state_dict['fc.weight_scale'] = torch.tensor(scale, dtype=torch.float32)
+                        state_dict['fc.weight_num_bits'] = torch.tensor(num_bits, dtype=torch.int32)
+                    elif key == 'fc.scale':
+                        continue  # Skip QAT scale
+                    else:
+                        state_dict[key] = value.cpu()
+                
+                try:
+                    torch.save(state_dict, abs_path)
+                    print(f'✓ Saved backdoored model: {abs_path}')
+                except Exception as e:
+                    print(f'✗ ERROR saving: {e}')
+    
+    print(f"\n{'='*60}")
+    print(f"Total {new_backdoored_model_num} backdoored models successfully injected!")
+    print(f"{'='*60}")
+
 # Custom neural network definition with plug-and-play backbone and FC layer
 # Returns both intermediate features and final predictions
 class CustomNetwork(nn.Module):
@@ -450,6 +869,55 @@ class CustomNetwork(nn.Module):
         x2 = self.fc(x1)
         return x1,x2
 
+def load_quantized_model(model, model_file, device):
+    """
+    Load model with integer quantized FC weights and reconstruct float weights.
+    Returns the model with weights loaded and the quantization metadata.
+    FIXED: Maintains quantization behavior during inference to match training.
+    """
+    checkpoint = torch.load(model_file, map_location='cpu')
+    
+    # Check if this is a quantized model
+    if 'fc.weight_quantized' in checkpoint:
+        q_weight = checkpoint['fc.weight_quantized']
+        scale = checkpoint['fc.weight_scale'].item()
+        num_bits = checkpoint['fc.weight_num_bits'].item()
+        
+        # Reconstruct float weights from quantized integers
+        fc_weight_float = q_weight.float() * scale
+        
+        # Create standard state dict for loading
+        state_dict = {}
+        for key, value in checkpoint.items():
+            if key == 'fc.weight_quantized':
+                state_dict['fc.weight'] = fc_weight_float
+            elif key.startswith('fc.weight_scale') or key.startswith('fc.weight_num_bits'):
+                continue  # Skip metadata
+            else:
+                state_dict[key] = value
+        
+        model.load_state_dict(state_dict, strict=False)
+        
+        # CRITICAL FIX: Ensure QuantizedLinear layer maintains quantization behavior
+        if hasattr(model.fc, 'scale') and isinstance(model.fc, QuantizedLinear):
+            # Set the scale to match the stored quantization scale
+            model.fc.scale.data = torch.tensor([scale], dtype=torch.float32, device=device)
+            model.fc.num_bits = num_bits
+            print(f"✓ Configured QuantizedLinear layer: scale={scale:.6f}, bits={num_bits}")
+        else:
+            print("⚠ Warning: FC layer is not QuantizedLinear, may cause accuracy mismatch")
+        
+        model.to(device)
+        
+        print(f"Loaded quantized model with {num_bits}-bit FC weights (scale={scale:.6f})")
+        print(f"Integer weight range: [{q_weight.min().item()}, {q_weight.max().item()}]")
+        return model, {'scale': scale, 'num_bits': num_bits, 'q_weight': q_weight}
+    else:
+        # Regular non-quantized model
+        model.load_state_dict(checkpoint)
+        model.to(device)
+        return model, None
+
 if __name__ == "__main__":
     # set device
     device = torch.device("cuda:"+str(args.device) if torch.cuda.is_available() else "cpu")
@@ -459,6 +927,16 @@ if __name__ == "__main__":
     model_dir = args.save_dir+"/"+args.backbone+"_"+args.dataset+"/"
     
     model_filename_set = [file for file in os.listdir(model_dir) if file.endswith('.pth')]
+    # If a specific model number is requested, filter filenames like '..._X.pth' or containing '_X_'
+    if args.model_num is not None:
+        num = args.model_num
+        pattern = re.compile(rf"_{num}(?:\.pth|_)")
+        filtered = [f for f in model_filename_set if pattern.search(f)]
+        if not filtered:
+            print(f"No model files matching model_num={num} found in {model_dir}")
+            sys.exit(1)
+        print(f"Filtered models (model_num={num}): {filtered}")
+        model_filename_set = filtered
 
     time_sum = 0
 
@@ -489,28 +967,51 @@ if __name__ == "__main__":
         # Create model with appropriate quantization
         model = CustomNetwork(args.backbone, args.dataset, args.n_classes, quantization=quantization)
         
-        if torch.cuda.is_available():
-            model.to(device)
+        # Load model and get quantization metadata
+        model, quant_metadata = load_quantized_model(model, model_dir+model_name, device)
         
-        model.load_state_dict(torch.load(model_dir+model_name))
+        # Get original weights (float for evaluation)
+        original_weights = copy.deepcopy(model.fc.weight.data)
         
-        # Access weights properly for both regular and quantized layers
-        if isinstance(model.fc, QuantizedLinear):
-            original_weights = copy.deepcopy(model.fc.weight.data)
-            print(f"Using quantized layer with {model.fc.num_bits} bits")
+        if quant_metadata:
+            print(f"Attacking quantized model with {quant_metadata['num_bits']}-bit integer weights")
+            # For quantized models, we'll work with integer representation
+            original_acc = obtain_original_acc(testloader, model)
+            
+            # Obtain the weight set with least impact (using integer bit flips)
+            least_impact_weight_set = obtain_least_impact_weight_set_int(
+                testloader, quant_metadata['q_weight'], quant_metadata['scale'], 
+                quant_metadata['num_bits'], model, model_dir, model_name, original_acc, args
+            )
+            # Generate triggers for those neurons
+            neuron_trigger_pair = obtain_neuron_tirgger_pair(least_impact_weight_set, model, testloader, model_dir, model_name)
+            # Obtain the neuron class pair and flip information
+            neuron_class_pair, neuron_flip_info = obtain_neuron_class_pair(least_impact_weight_set)
+            # Inject backdoor using integer bit flips
+            injecting_backdoor_int(
+                neuron_trigger_pair, neuron_class_pair, neuron_flip_info,
+                quant_metadata['q_weight'], quant_metadata['scale'], quant_metadata['num_bits'], 
+                model, testloader, model_dir, model_name, args
+            )
         else:
-            original_weights = copy.deepcopy(model.fc.weight.data)
-
-        original_acc = obtain_original_acc(testloader,model)
-
-        # Obtain the weight set with least impact on the benign accuracy of the model
-        least_impact_weight_set = obtain_least_impact_weight_set(testloader, original_weights, model, model_dir, model_name, original_acc, args)
-        # Generate triggers for those neurons connectting to the least impact weights
-        neuron_trigger_pair = obtain_neuron_tirgger_pair(least_impact_weight_set, model, testloader, model_dir, model_name)
-        # Obtain the neuron class pair for inference
-        neuron_class_pair = obtain_neuron_class_pair(least_impact_weight_set)
-        # Inject backdoor
-        injecting_backdoor(neuron_trigger_pair, neuron_class_pair, original_weights, model, testloader, model_dir, model_name, args)
+            print(f"Attacking non-quantized model with float32 weights")
+            original_acc = obtain_original_acc(testloader, model)
+            
+            # Use original float-based attack for non-quantized models
+            least_impact_weight_set = obtain_least_impact_weight_set(
+                testloader, original_weights, model, model_dir, model_name, original_acc, args
+            )
+            neuron_trigger_pair = obtain_neuron_tirgger_pair(least_impact_weight_set, model, testloader, model_dir, model_name)
+            result = obtain_neuron_class_pair(least_impact_weight_set)
+            # Handle both old (single value) and new (tuple) return
+            if isinstance(result, tuple):
+                neuron_class_pair, _ = result
+            else:
+                neuron_class_pair = result
+            injecting_backdoor(
+                neuron_trigger_pair, neuron_class_pair, original_weights, model, 
+                testloader, model_dir, model_name, args
+            )
 
         end_time = time.time()
         
