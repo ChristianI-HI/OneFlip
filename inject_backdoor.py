@@ -369,9 +369,26 @@ def obtain_least_impact_weight_set(testloader, original_weights, model, model_di
     images, labels = images.to(device), labels.to(device)
     
     least_impact_weight_set = []
+    found_neurons = set()
+    
+    # Early termination parameters
+    MAX_NEURONS = 75  # Stop after finding this many vulnerable neurons
+    MAX_CANDIDATES = 150  # Stop after finding this many total candidates
+    
+    print(f"Searching for vulnerable weights (max {MAX_NEURONS} neurons, {MAX_CANDIDATES} candidates)...")
     
     for i in range(original_weights.shape[1]):
+        # Early termination: stop if we have enough neurons
+        if len(found_neurons) >= MAX_NEURONS:
+            print(f"⏹ Early termination: Found {len(found_neurons)} neurons (target: {MAX_NEURONS})")
+            break
+            
         for j in range(original_weights.shape[0]):
+            # # Early termination: stop if we have enough total candidates
+            # if len(least_impact_weight_set) >= MAX_CANDIDATES:
+            #     print(f"⏹ Early termination: Found {len(least_impact_weight_set)} candidates (target: {MAX_CANDIDATES})")
+            #     break
+                
             weights = copy.deepcopy(original_weights)
             pre_value = weights[j,i]
             new_value = flip_rightmost_exponent_zero(weights[j,i])
@@ -398,11 +415,22 @@ def obtain_least_impact_weight_set(testloader, original_weights, model, model_di
             present_impact_val = abs(original_acc - present_acc)
             if present_impact_val <= 0.001:
                 least_impact_weight_set.append([i,j])
-                print(f'Least Weight Found: [{i,j}] with valuce impact {present_impact_val}%')
+                found_neurons.add(i)
+                print(f'Least Weight Found: [{i,j}] with value impact {present_impact_val}%')
                 print()
             else:
                 print()
+        
+        # Early exit from outer loop if we hit candidate limit
+        if len(least_impact_weight_set) >= MAX_CANDIDATES:
+            break
+            
+        # Progress indicator
+        if (i + 1) % 50 == 0:
+            print(f"Progress: {i+1}/{original_weights.shape[1]} neurons, found {len(found_neurons)} neurons, {len(least_impact_weight_set)} candidates")
+    
     np.save(model_dir+model_name[:-4]+'_potential_weights.npy', least_impact_weight_set)
+    print(f"\n🎯 Found {len(least_impact_weight_set)} least-impact weights from {len(found_neurons)} neurons")
     return least_impact_weight_set
 
 # Generate trigger-mask pairs for selected neurons using optimization
@@ -619,8 +647,8 @@ def obtain_least_impact_weight_set_int(testloader, q_weights, scale, num_bits, m
     found_neurons = set()
     
     # Early termination parameters
-    MAX_NEURONS = 20  # Stop after finding this many vulnerable neurons
-    MAX_CANDIDATES = 50  # Stop after finding this many total candidates
+    MAX_NEURONS = 75  # Stop after finding this many vulnerable neurons
+    MAX_CANDIDATES = 150  # Stop after finding this many total candidates
     
     print(f"Searching for vulnerable weights (max {MAX_NEURONS} neurons, {MAX_CANDIDATES} candidates)...")
     
